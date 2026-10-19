@@ -20,7 +20,7 @@ export const POSTURE = {
   differentialFeatherCost: 0.2,
   tailCost: 0.1,
   shoulderRateCost: 4,
-  shoulderPoseCost: 100,
+  shoulderPoseCost: 10000, // Restore released wings promptly; opposed angles can turn a level body.
 };
 
 /** Attitude error and damping, independent of which joints supply the correction. */

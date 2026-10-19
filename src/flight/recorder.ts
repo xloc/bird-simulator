@@ -1,6 +1,7 @@
 import { Euler } from "three";
 import { DEG } from "./aerodynamics";
 import type { FlightInput, FlightModel } from "./model";
+import { LOCOMOTION_PHASES } from "./model";
 import { postureControl } from "./posture";
 
 export const FLIGHT_LOG_PATH = "/__flight-log";
@@ -61,6 +62,7 @@ export const FLIGHT_LOG_COLUMNS = [
   "tail_cant_deg",
   "motion_age_ms",
   "grounded",
+  "locomotion",
 ] as const;
 export const FLIGHT_OVERVIEW_COLUMNS = [
   "t_s",
@@ -123,7 +125,7 @@ export class FlightRecorder {
       startedAt: new Date().toISOString(),
       endedAt: null,
       reason: null,
-      metadata,
+      metadata: { ...metadata, locomotion: LOCOMOTION_PHASES },
       summary: {
         durationS: 0,
         samples: 0,
@@ -204,6 +206,7 @@ export class FlightRecorder {
       flight.tailCant / DEG,
       Number.isFinite(motionAge) ? motionAge : -1,
       Number(flight.grounded),
+      LOCOMOTION_PHASES.indexOf(flight.phase),
     ].map((n) => Math.round(n * 1000) / 1000);
     const summary = this.packet.summary;
     const bank = -pose.z / DEG;

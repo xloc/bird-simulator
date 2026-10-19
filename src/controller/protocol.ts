@@ -6,6 +6,9 @@ export interface InputSample {
   left: number;
   right: number;
   options: boolean;
+  triangle: boolean;
+  leftStick: { x: number; y: number };
+  rightStick: { x: number; y: number };
   transport: Transport;
   motion: { gyro: Vector3; acceleration: Vector3; timestamp: number } | null;
 }
@@ -60,11 +63,18 @@ export function parseInput(
   data: DataView,
   calibration = defaultCalibration(),
 ): InputSample | null {
+  const axes = (offset: number) => ({
+    x: data.getUint8(offset) / 127.5 - 1,
+    y: data.getUint8(offset + 1) / 127.5 - 1,
+  });
   if (reportId === 1 && data.byteLength === 9) {
     return {
       left: data.getUint8(7) / 255,
       right: data.getUint8(8) / 255,
       options: (data.getUint8(5) & 0x20) !== 0,
+      triangle: (data.getUint8(4) & 0x80) !== 0,
+      leftStick: axes(0),
+      rightStick: axes(2),
       transport: "bluetooth",
       motion: null,
     };
@@ -86,6 +96,9 @@ export function parseInput(
     left: data.getUint8(offset + 4) / 255,
     right: data.getUint8(offset + 5) / 255,
     options: (data.getUint8(offset + 8) & 0x20) !== 0,
+    triangle: (data.getUint8(offset + 7) & 0x80) !== 0,
+    leftStick: axes(offset),
+    rightStick: axes(offset + 2),
     transport: bluetooth ? "bluetooth" : "usb",
     motion: {
       gyro: vector(15).multiply(calibration.gyroScale),

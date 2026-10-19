@@ -44,7 +44,7 @@ it("automatically saves a bounded trace, early divergence summary and final cras
   }
   flight.time = 130.025; // Ground contact between regular 10 Hz samples.
   flight.position.y = 0.8;
-  flight.grounded = true;
+  flight.phase = "walking";
   const before = flight.orientation.clone();
   recorder.sample(flight, NEUTRAL_INPUT, 4, true);
   expect(flight.orientation.equals(before)).toBe(true);
@@ -93,7 +93,7 @@ it("flushes the crash after an earlier upload finishes", async () => {
   recorder.sample(flight, NEUTRAL_INPUT, 0);
   const first = recorder.flush(true);
   flight.time = 0.025;
-  flight.grounded = true;
+  flight.phase = "walking";
   recorder.sample(flight, NEUTRAL_INPUT, 0, true);
   recorder.finish("Ground reached.");
   release();

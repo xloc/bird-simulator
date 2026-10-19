@@ -4,6 +4,8 @@ import { DualSense } from "./controller/device";
 import { TorqueFeedback } from "./controller/feedback";
 import { MotionFilter, TABLE_CAPTURE_SECONDS } from "./controller/motion";
 import { KEYBOARD_BINDINGS, keyboardInput } from "./controller/keyboard";
+import { NEUTRAL_PLAYER_INPUT, stick } from "./controller/input";
+import type { PlayerInput } from "./controller/input";
 import {
   loadPreferences,
   savePreferences,
@@ -13,15 +15,18 @@ import {
 } from "./controller/preferences";
 import { DEG, POLAR } from "./flight/aerodynamics";
 import { FixedClock, InputTimeline } from "./flight/clock";
-import { BIRD, FlightModel, NEUTRAL_INPUT } from "./flight/model";
+import { BIRD, GROUND, FlightModel } from "./flight/model";
 import type { FlightInput } from "./flight/model";
+import { BirdCamera } from "./flight/camera";
 import { POSTURE } from "./flight/posture";
 import { FlightRecorder } from "./flight/recorder";
 
 export const useSession = defineStore("session", () => {
   const model = shallowRef(markRaw(new FlightModel()));
   const clock = markRaw(new FixedClock());
-  const timeline = new InputTimeline();
+  const camera = markRaw(new BirdCamera());
+  camera.reset(model.value);
+  const timeline = new InputTimeline(NEUTRAL_PLAYER_INPUT);
   let stepAt = 0;
   let lastFrameAt = 0;
   let motion = new MotionFilter();
@@ -30,8 +35,7 @@ export const useSession = defineStore("session", () => {
   let recorder: FlightRecorder | null = null;
   let lastFlightInput: FlightInput = { left: 0, right: 0, pitch: 0, roll: 0 };
   const recordingStatus = ref("");
-  let rawLeft = 0;
-  let rawRight = 0;
+  const controllerInput = { ...NEUTRAL_PLAYER_INPUT };
   let optionsDown = false;
   let operation = 0;
   let scheduledAction: (() => void) | null = null;
@@ -56,13 +60,14 @@ export const useSession = defineStore("session", () => {
     showForces: false,
   });
   watch(settings, savePreferences, { flush: "sync" });
-  const keyboard = reactive({ ...NEUTRAL_INPUT });
+  const keyboard = reactive({ ...NEUTRAL_PLAYER_INPUT });
   const pressed = new Set<string>();
   const telemetry = reactive({
     speed: model.value.velocity.length(),
     height: 80,
     sink: model.value.velocity.y,
     time: 0,
+    phase: model.value.phase,
     left: 0,
     right: 0,
     pitch: 0,
@@ -95,18 +100,31 @@ export const useSession = defineStore("session", () => {
   );
   const ready = computed(() => canStart.value && (mode.value === "keyboard" || calibrated.value));
 
-  function input(): FlightInput {
+  const activityMessages = {
+    flying: "In flight.",
+    walking: "Walking.",
+    hopping: "Jumping. Flap to take flight.",
+    launching: "Taking off.",
+  };
+
+  function input(): PlayerInput {
     if (mode.value === "keyboard") return { ...keyboard };
     return {
-      left: rawLeft,
-      right: rawRight,
+      ...controllerInput,
       ...motion.commands(settings.invertPitch, settings.invertRoll),
     };
   }
 
+  function groundInput(command: PlayerInput) {
+    const direction = model.value.grounded
+      ? camera.walkingDirection(command.walkX, command.walkY)
+      : camera.walkingDirection(0, 0);
+    return { ...direction, jump: command.jump };
+  }
+
   function releaseKeys() {
     pressed.clear();
-    Object.assign(keyboard, NEUTRAL_INPUT);
+    Object.assign(keyboard, NEUTRAL_PLAYER_INPUT);
   }
 
   function stop(reason = "Paused.") {
@@ -141,10 +159,20 @@ export const useSession = defineStore("session", () => {
     calibrating.value = false;
     telemetry.motionReady = false;
     optionsDown = false;
+    Object.assign(controllerInput, NEUTRAL_PLAYER_INPUT);
     const controller = new DualSense(
       (sample) => {
-        rawLeft = sample.left;
-        rawRight = sample.right;
+        const walk = stick(sample.leftStick.x, sample.leftStick.y);
+        const look = stick(sample.rightStick.x, sample.rightStick.y);
+        Object.assign(controllerInput, {
+          left: sample.left,
+          right: sample.right,
+          walkX: walk.x,
+          walkY: walk.y,
+          lookX: look.x,
+          lookY: look.y,
+          jump: sample.triangle,
+        });
         if (sample.motion) {
           if (motion.calibrating && document.hidden) motion.resetCapture();
           else
@@ -229,7 +257,6 @@ export const useSession = defineStore("session", () => {
 
   async function start() {
     if (!ready.value || starting.value || running.value) return;
-    if (model.value.grounded) reset();
     error.value = "";
     starting.value = true;
     const request = ++operation;
@@ -242,7 +269,8 @@ export const useSession = defineStore("session", () => {
       stop("Motion input stopped before flight could start.");
       return;
     }
-    model.value.synchronize(input());
+    const command = input();
+    model.value.synchronize(command, groundInput(command));
     clock.accumulator = 0;
     lastFrameAt = performance.now();
     stepAt = lastFrameAt / 1000;
@@ -258,9 +286,10 @@ export const useSession = defineStore("session", () => {
           settings: { ...settings },
           tableReference: motion.reference,
           bird: BIRD,
+          ground: GROUND,
           posture: POSTURE,
           polar: POLAR,
-          flightModel: "coordinated-strokes-v2",
+          flightModel: "ground-flight-v1",
           modelStartTimeS: model.value.time,
         },
         model.value.time,
@@ -274,17 +303,19 @@ export const useSession = defineStore("session", () => {
     }
     running.value = true;
     starting.value = false;
-    message.value = "In flight.";
+    message.value = activityMessages[model.value.phase];
   }
 
   function reset() {
     stop("Reset to a trimmed glide. Start when you are ready.");
     model.value = markRaw(new FlightModel());
+    camera.reset(model.value);
+    telemetry.phase = model.value.phase;
   }
 
   function chooseMode(value: "controller" | "keyboard") {
     if (mode.value === value) return;
-    reset();
+    stop();
     mode.value = value;
     message.value =
       value === "keyboard"
@@ -362,7 +393,10 @@ export const useSession = defineStore("session", () => {
 
   function frame() {
     if (!running.value) {
-      if (mode.value === "keyboard" || connected.value) model.value.synchronize(input());
+      if (mode.value === "keyboard" || connected.value) {
+        const command = input();
+        model.value.synchronize(command, groundInput(command));
+      }
       return;
     }
     const now = performance.now();
@@ -372,7 +406,13 @@ export const useSession = defineStore("session", () => {
       !clock.advance(delta, (dt) => {
         stepAt += dt;
         const command = timeline.sample(stepAt);
-        model.value.step(command, dt);
+        const phase = model.value.phase;
+        model.value.step(command, dt, groundInput(command));
+        camera.step(model.value, command.lookX, command.lookY, dt);
+        if (model.value.phase !== phase) {
+          telemetry.phase = model.value.phase;
+          message.value = activityMessages[model.value.phase];
+        }
         lastFlightInput = command;
         recorder?.sample(
           model.value,
@@ -380,14 +420,15 @@ export const useSession = defineStore("session", () => {
           mode.value === "controller" && device
             ? Math.max(0, performance.now() - device.lastMotionAt)
             : 0,
-          model.value.grounded,
+          model.value.phase !== phase,
         );
         for (let i = 0; i < 2; i++)
-          feedback[i]!.update(model.value.wings[i]!.torque, settings.comfort, dt);
+          if (model.value.phase === "flying")
+            feedback[i]!.update(model.value.wings[i]!.torque, settings.comfort, dt);
+          else feedback[i]!.reset();
       })
     )
       stop("Paused after a long frame. Resume when ready.");
-    if (model.value.grounded) stop("Ground reached. Reset to try another flight.");
   }
 
   // Independent of rendering: watch freshness, send latest effects, sample UI.
@@ -413,10 +454,13 @@ export const useSession = defineStore("session", () => {
     const f = model.value;
     const command = input();
     Object.assign(telemetry, {
-      speed: f.velocity.clone().sub(f.wind).length(),
+      speed: f.flying
+        ? f.velocity.clone().sub(f.wind).length()
+        : Math.hypot(f.velocity.x, f.velocity.z),
       height: f.position.y,
       sink: f.velocity.y,
       time: f.time,
+      phase: f.phase,
       left: command.left,
       right: command.right,
       pitch: command.pitch / DEG,
@@ -474,6 +518,7 @@ export const useSession = defineStore("session", () => {
   return {
     model,
     clock,
+    camera,
     connected,
     connecting,
     running,

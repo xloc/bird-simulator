@@ -1,8 +1,40 @@
 import { describe, expect, it } from "vite-plus/test";
 import { crc32 as referenceCrc } from "node:zlib";
 import { crc32, outputReport, parseInput, readCalibration, triggerEffect } from "./protocol";
+import { stick } from "./input";
 
 describe("DualSense packet layouts", () => {
+  it.each([
+    { name: "USB", reportId: 1, length: 63, offset: 0, buttons: 7 },
+    { name: "full Bluetooth", reportId: 0x31, length: 77, offset: 1, buttons: 8 },
+    { name: "minimal Bluetooth", reportId: 1, length: 9, offset: 0, buttons: 4 },
+  ])("reads both sticks and Triangle in $name reports", ({ reportId, length, offset, buttons }) => {
+    const bytes = new Uint8Array(length);
+    const data = new DataView(bytes.buffer);
+    const read = () => {
+      if (reportId === 0x31)
+        data.setUint32(
+          73,
+          referenceCrc(Uint8Array.from([0xa1, reportId, ...bytes.subarray(0, 73)])),
+          true,
+        );
+      return parseInput(reportId, data)!;
+    };
+    bytes.fill(128, offset, offset + 4);
+    bytes[buttons] = 0x7f;
+    expect(read().triangle).toBe(false);
+    expect(stick(read().leftStick.x, read().leftStick.y)).toEqual({ x: 0, y: 0 });
+    bytes.set([0, 255, 255, 0], offset);
+    bytes[buttons] = 0x80;
+    const sample = read();
+    expect(sample.triangle).toBe(true);
+    expect(sample.options).toBe(false);
+    expect(sample.leftStick).toEqual({ x: -1, y: 1 });
+    expect(sample.rightStick).toEqual({ x: 1, y: -1 });
+    const diagonal = stick(sample.rightStick.x, sample.rightStick.y);
+    expect(Math.hypot(diagonal.x, diagonal.y)).toBeCloseTo(1);
+  });
+
   it.each([
     { name: "USB", reportId: 1, length: 63, offset: 8 },
     { name: "full Bluetooth", reportId: 0x31, length: 77, offset: 9 },

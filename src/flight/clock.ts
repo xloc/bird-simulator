@@ -1,16 +1,19 @@
-import type { FlightInput } from "./model";
-
 /** Causal sample-and-hold input: catch-up steps consume their own arrival times. */
-export class InputTimeline {
-  private pending: { time: number; input: FlightInput }[] = [];
-  private current: FlightInput = { left: 0, right: 0, pitch: 0, roll: 0 };
+export class InputTimeline<T> {
+  private pending: { time: number; input: T }[] = [];
 
-  reset(input: FlightInput) {
+  private current: T;
+
+  constructor(input: T) {
+    this.current = input;
+  }
+
+  reset(input: T) {
     this.pending = [];
     this.current = input;
   }
 
-  push(time: number, input: FlightInput) {
+  push(time: number, input: T) {
     this.pending.push({ time, input });
   }
 

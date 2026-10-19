@@ -1,7 +1,7 @@
 import { describe, expect, it } from "vite-plus/test";
 import { Euler, Vector3 } from "three";
 import { coefficients, DEG, stripForce } from "./aerodynamics";
-import { BIRD, FlightModel, NEUTRAL_INPUT, triggerAngle } from "./model";
+import { BIRD, GROUND, FlightModel, NEUTRAL_INPUT, triggerAngle } from "./model";
 import { FixedClock, InputTimeline } from "./clock";
 
 const chord = new Vector3(0, 0, -1);
@@ -276,7 +276,10 @@ describe("manual wings and flight", () => {
     expect(f.grounded).toBe(true);
     const position = f.position.clone();
     f.step(NEUTRAL_INPUT, 1 / 120);
-    expect(f.position.toArray()).toEqual(position.toArray());
+    expect(f.position.y).toBeGreaterThanOrEqual(position.y);
+    expect(f.position.y).toBeLessThanOrEqual(GROUND.height);
+    expect(f.phase).toBe("walking");
+    expect(f.position.distanceTo(position)).toBeLessThan(1);
   });
 });
 
@@ -304,7 +307,7 @@ it("replays changing timestamped input identically at 30, 60 and 144 Hz renderin
   const run = (fps: number) => {
     const f = new FlightModel();
     const clock = new FixedClock();
-    const timeline = new InputTimeline();
+    const timeline = new InputTimeline(NEUTRAL_INPUT);
     timeline.reset(NEUTRAL_INPUT);
     let delivered = 0;
     let simulationTime = 0;

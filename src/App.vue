@@ -42,12 +42,16 @@ onErrorCaptured((error) => {
           >
             {{
               session.running
-                ? session.telemetry.stalled
-                  ? "SEPARATED FLOW"
-                  : "IN FLIGHT"
-                : session.model.grounded
-                  ? "GROUNDED"
-                  : "PAUSED"
+                ? session.telemetry.phase === "walking"
+                  ? "WALKING"
+                  : session.telemetry.phase === "hopping"
+                    ? "JUMPING"
+                    : session.telemetry.phase === "launching"
+                      ? "TAKING OFF"
+                      : session.telemetry.stalled
+                        ? "SEPARATED FLOW"
+                        : "IN FLIGHT"
+                : "PAUSED"
             }}
           </span>
         </div>
@@ -69,7 +73,11 @@ onErrorCaptured((error) => {
             >
               <div>
                 <dt class="text-[10px] tracking-[0.12em] text-white/60 sm:tracking-[0.18em]">
-                  AIRSPEED
+                  {{
+                    session.telemetry.phase === "walking" || session.telemetry.phase === "hopping"
+                      ? "SPEED"
+                      : "AIRSPEED"
+                  }}
                 </dt>
                 <dd
                   class="mt-1 whitespace-nowrap text-base font-light tabular-nums min-[360px]:text-lg sm:text-2xl xl:text-3xl"
@@ -184,10 +192,13 @@ onErrorCaptured((error) => {
                   : session.countdown
                     ? "Cancel countdown"
                     : session.running
-                      ? "Pause flight"
+                      ? "Pause"
                       : session.starting
                         ? "Starting…"
-                        : "Start flight"
+                        : session.telemetry.phase === "walking" ||
+                            session.telemetry.phase === "hopping"
+                          ? "Resume"
+                          : "Start flight"
               }}
             </button>
             <button :class="button" @click="session.reset">Reset</button>
@@ -254,9 +265,20 @@ onErrorCaptured((error) => {
                   Disconnect
                 </button>
               </div>
-              <div class="flex items-center justify-between text-xs text-white/60">
-                <span>Start / pause</span>
-                <kbd class="font-sans">Options</kbd>
+              <div
+                v-for="[label, control] in [
+                  ['Start / pause', 'Options'],
+                  ['Walk', 'Left stick'],
+                  ['Look around', 'Right stick'],
+                  ['Hold to charge / release to jump', 'Triangle'],
+                  ['Left / right wing', 'L2 / R2'],
+                  ['Take off', 'Both triggers'],
+                ]"
+                :key="label"
+                class="flex items-center justify-between text-xs text-white/60"
+              >
+                <span>{{ label }}</span>
+                <kbd class="font-sans">{{ control }}</kbd>
               </div>
               <p
                 v-if="session.telemetry.motionAge > 250"

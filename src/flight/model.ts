@@ -1,6 +1,7 @@
 import { Quaternion, Vector3 } from "three";
 import { clamp, DEG, stripForce } from "./aerodynamics";
 import { POSTURE, allocateJoints, postureAcceleration, attitudeAcceleration } from "./posture";
+import { BirdLegs, LEGS } from "./legs";
 
 export const BIRD = {
   mass: 0.8,
@@ -41,6 +42,29 @@ export interface FlightInput {
   roll: number; // Desired right bank, radians.
 }
 export const NEUTRAL_INPUT: FlightInput = { left: 0, right: 0, pitch: 0, roll: 0 };
+
+export const GROUND = {
+  height: LEGS.standingHeight,
+  walkSpeed: 1.6,
+  acceleration: 12,
+  braking: 20,
+  chargeTime: 0.55,
+  crouchDepth: 0.12,
+  minJumpHeight: 0.1,
+  maxJumpHeight: 0.65,
+  launchSpeed: 5.5,
+  launchForward: 7,
+  takeoffTrigger: 0.15,
+  wingClearance: BIRD.wingLength + 0.15,
+};
+export const LOCOMOTION_PHASES = ["flying", "walking", "hopping", "launching"] as const;
+export type Locomotion = (typeof LOCOMOTION_PHASES)[number];
+export interface GroundInput {
+  x: number; // World-space walking direction, magnitude 0..1.
+  z: number;
+  jump: boolean;
+}
+export const NEUTRAL_GROUND_INPUT: GroundInput = { x: 0, z: 0, jump: false };
 
 export interface Surface {
   position: Vector3;
@@ -162,7 +186,28 @@ export class FlightModel {
   jointWork = 0;
   aerodynamicWork = 0;
   time = 0;
-  grounded = false;
+  phase: Locomotion = "flying";
+  legs = new BirdLegs();
+  jumpCharge = 0;
+  chargingJump = false;
+  private landingCompression = 0;
+  private jumpHeld = false;
+  private takeoffReady = false;
+  private groundHeading = 0;
+  private takeoffAge = Infinity;
+
+  get grounded() {
+    return this.phase === "walking";
+  }
+
+  get flying() {
+    return this.phase === "flying" || this.phase === "launching";
+  }
+
+  get heading() {
+    const forward = new Vector3(0, 0, -1).applyQuaternion(this.orientation);
+    return Math.atan2(-forward.x, -forward.z);
+  }
 
   constructor(strips = 8) {
     this.wings = [wing(-1, strips), wing(1, strips)];
@@ -170,6 +215,8 @@ export class FlightModel {
     this.trim();
     this.syncGeometry();
     this.loads();
+    this.legs.step(this.position, this.orientation, this.velocity, false, 1);
+    for (const foot of this.legs.feet) foot.previous.copy(foot.position);
   }
 
   private syncGeometry() {
@@ -209,7 +256,18 @@ export class FlightModel {
   }
 
   /** Preview/start/resume without inventing a fast stroke or recapturing a held pull. */
-  synchronize(input: FlightInput) {
+  synchronize(input: FlightInput, ground = NEUTRAL_GROUND_INPUT) {
+    this.jumpHeld = ground.jump;
+    this.chargingJump = false;
+    this.jumpCharge = 0;
+    if (this.phase !== "flying") {
+      this.groundWings(input, 0);
+      if (input.left > BIRD.triggerRelease || input.right > BIRD.triggerRelease)
+        this.takeoffReady = false;
+      this.previousPosition.copy(this.position);
+      this.previousOrientation.copy(this.orientation);
+      return;
+    }
     for (const [i, w] of this.wings.entries()) {
       this.updateStroke(w, i === 0 ? input.left : input.right);
       w.angle = w.target;
@@ -484,11 +542,143 @@ export class FlightModel {
     this.force.y -= BIRD.mass * BIRD.gravity;
   }
 
-  step(input: FlightInput, dt: number) {
-    if (this.grounded) return;
+  private groundWings(input: FlightInput, dt: number) {
+    for (const [i, w] of this.wings.entries()) {
+      const trigger = i === 0 ? input.left : input.right;
+      const angle = this.phase === "launching" ? -15 * DEG : (15 + trigger * 10) * DEG;
+      const fold = this.phase === "launching" ? 0 : (160 - trigger * 20) * DEG;
+      w.angle += clamp(angle - w.angle, -12 * dt, 12 * dt);
+      w.fold += clamp(fold - w.fold, -24 * dt, 24 * dt);
+      w.baseline = w.target = w.angle;
+      w.rate = w.torque = w.power = 0;
+      w.manual = w.returning = false;
+      w.incidence = BIRD.wingIncidence;
+    }
+    this.tailIncidence = this.tailTrim;
+    this.tailCant = 0;
+    this.syncGeometry();
+    // Fold the unloaded wings along the back, leaving room for the legs to step.
+    if (this.phase !== "launching") {
+      for (const w of this.wings) {
+        const sweep = -w.side * 80 * DEG;
+        for (const s of w.surfaces) {
+          s.position.sub(w.shoulder).applyAxisAngle(Y, sweep).add(w.shoulder);
+          s.chord.applyAxisAngle(Y, sweep);
+          s.normal.applyAxisAngle(Y, sweep);
+        }
+      }
+    }
+    this.force.set(0, 0, 0);
+    this.moment.set(0, 0, 0);
+    this.jointPower = this.aerodynamicPower = 0;
+    for (const s of this.surfaces) {
+      s.force.set(0, 0, 0);
+      s.separated = s.alpha = s.speed = 0;
+    }
+  }
+
+  private land(input: FlightInput) {
+    this.groundHeading = this.heading;
+    this.phase = "walking";
+    this.landingCompression = Math.min(0.1, Math.abs(this.velocity.y) * 0.018);
+    this.position.y = GROUND.height - this.landingCompression;
+    this.velocity.y = 0;
+    this.velocity.clampLength(0, GROUND.walkSpeed);
+    this.omega.set(0, 0, 0);
+    this.chargingJump = false;
+    this.jumpCharge = 0;
+    this.orientation.setFromAxisAngle(Y, this.groundHeading);
+    this.legs.plant(this.position, this.orientation);
+    this.takeoffReady = input.left <= BIRD.triggerRelease && input.right <= BIRD.triggerRelease;
+  }
+
+  private groundStep(input: FlightInput, ground: GroundInput, jump: boolean, dt: number) {
+    if (input.left <= BIRD.triggerRelease && input.right <= BIRD.triggerRelease)
+      this.takeoffReady = true;
+    if (this.grounded && jump) this.chargingJump = true;
+    if (this.chargingJump && ground.jump) {
+      this.jumpCharge = Math.min(1, this.jumpCharge + dt / GROUND.chargeTime);
+    }
+    if (this.grounded && this.chargingJump && !ground.jump) {
+      const height =
+        GROUND.minJumpHeight + (GROUND.maxJumpHeight - GROUND.minJumpHeight) * this.jumpCharge;
+      // Stored leg work lifts the crouched body and supplies the chosen jump height.
+      this.velocity.y = Math.sqrt(2 * BIRD.gravity * (height + GROUND.height - this.position.y));
+      this.phase = "hopping";
+      this.chargingJump = false;
+      this.jumpCharge = 0;
+      this.landingCompression = 0;
+    }
+    const left = input.left >= GROUND.takeoffTrigger;
+    const right = input.right >= GROUND.takeoffTrigger;
+    if (
+      this.takeoffReady &&
+      ((this.grounded && !this.chargingJump && left && right) ||
+        (this.phase === "hopping" && (left || right)))
+    ) {
+      if (this.grounded) {
+        this.velocity.y = GROUND.launchSpeed;
+        this.velocity.addScaledVector(
+          new Vector3(-Math.sin(this.groundHeading), 0, -Math.cos(this.groundHeading)),
+          GROUND.launchForward,
+        );
+      }
+      this.phase = "launching";
+      this.takeoffReady = false;
+    }
+    this.groundWings(input, dt);
+    if (
+      this.phase === "launching" &&
+      this.position.y >= GROUND.wingClearance &&
+      this.wings.every((w) => w.fold < 3 * DEG)
+    ) {
+      this.phase = "flying";
+      this.takeoffAge = 0;
+      this.syncGeometry();
+      return true;
+    }
+    if (this.grounded) {
+      const desired = new Vector3(ground.x, 0, ground.z).clampLength(0, 1);
+      if (desired.lengthSq() > 0.0001) this.groundHeading = Math.atan2(-desired.x, -desired.z);
+      const change = desired.multiplyScalar(GROUND.walkSpeed).sub(this.velocity);
+      const braking = change.dot(this.velocity) < 0;
+      this.velocity.add(
+        change.clampLength(0, (braking ? GROUND.braking : GROUND.acceleration) * dt),
+      );
+      this.landingCompression *= Math.exp(-18 * dt);
+      if (this.landingCompression < 0.0001) this.landingCompression = 0;
+      this.position.y =
+        GROUND.height -
+        Math.max(GROUND.crouchDepth * this.jumpCharge, this.landingCompression) +
+        this.legs.bob;
+    } else this.velocity.y -= BIRD.gravity * dt;
+    this.orientation.slerp(
+      new Quaternion().setFromAxisAngle(Y, this.groundHeading),
+      1 - Math.exp(-12 * dt),
+    );
+    this.position.addScaledVector(this.velocity, dt);
+    if (!this.grounded && this.position.y <= GROUND.height && this.velocity.y <= 0)
+      this.land(input);
+    return false;
+  }
+
+  step(input: FlightInput, dt: number, ground = NEUTRAL_GROUND_INPUT) {
     this.previousPosition.copy(this.position);
     this.previousOrientation.copy(this.orientation);
-    this.moveJoints(input, dt);
+    this.time += dt;
+    const jump = ground.jump && !this.jumpHeld;
+    this.jumpHeld = ground.jump;
+    if (this.phase !== "flying") {
+      if (!this.groundStep(input, ground, jump, dt)) {
+        this.legs.step(this.position, this.orientation, this.velocity, this.grounded, dt);
+        if (this.grounded)
+          this.position.y = this.legs.supportHeight(this.position, this.orientation);
+        return;
+      }
+    }
+    this.takeoffAge += dt;
+    const blend = Math.min(1, this.takeoffAge / 0.35);
+    this.moveJoints({ ...input, pitch: input.pitch * blend, roll: input.roll * blend }, dt);
     // Integrate only accepted loads, never the allocator's trial poses.
     this.jointWork += this.jointPower * dt;
     this.aerodynamicWork += this.aerodynamicPower * dt;
@@ -507,11 +697,11 @@ export class FlightModel {
           new Quaternion().setFromAxisAngle(this.omega.clone().divideScalar(rate), rate * dt),
         )
         .normalize();
-    this.time += dt;
-    if (this.position.y <= 0.8) {
-      this.position.y = 0.8;
-      this.grounded = true;
+    if (this.position.y <= GROUND.height && this.velocity.y <= 0) {
+      this.land(input);
+      this.groundWings(input, dt);
     }
+    this.legs.step(this.position, this.orientation, this.velocity, this.grounded, dt);
   }
 
   get energy() {

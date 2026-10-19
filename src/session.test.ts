@@ -4,6 +4,14 @@ import { Vector3 } from "three";
 import { useSession } from "./session";
 import type { InputSample } from "./controller/protocol";
 import { DEG } from "./flight/aerodynamics";
+import { NEUTRAL_PLAYER_INPUT } from "./controller/input";
+import { GROUND } from "./flight/model";
+
+const restingControls = {
+  triangle: false,
+  leftStick: { x: 0, y: 0 },
+  rightStick: { x: 0, y: 0 },
+};
 
 const hardware = vi.hoisted(() => ({
   off: vi.fn(async () => {}),
@@ -72,6 +80,7 @@ async function connectedSession() {
   const session = useSession();
   await session.connect();
   hardware.input({
+    ...restingControls,
     left: 0,
     right: 0,
     options: false,
@@ -82,6 +91,7 @@ async function connectedSession() {
   session.queueStart();
   for (let i = 1; i <= 130; i++)
     hardware.input({
+      ...restingControls,
       left: 0,
       right: 0,
       options: false,
@@ -157,7 +167,7 @@ describe("keyboard flight", () => {
       key("keydown", "ArrowUp");
       stop();
       expect(session.running).toBe(false);
-      expect(session.keyboard).toEqual({ left: 0, right: 0, pitch: 0, roll: 0 });
+      expect(session.keyboard).toEqual(NEUTRAL_PLAYER_INPUT);
       key("keyup", "KeyF");
       key("keyup", "ArrowUp");
     }
@@ -173,16 +183,135 @@ describe("keyboard flight", () => {
     Object.defineProperty(event, "target", { value: { closest: () => ({}) } });
     window.dispatchEvent(event);
     expect(event.defaultPrevented).toBe(false);
-    expect(session.keyboard).toEqual({ left: 0, right: 0, pitch: 0, roll: 0 });
+    expect(session.keyboard).toEqual(NEUTRAL_PLAYER_INPUT);
   });
 });
 
 describe("flight session lifecycle", () => {
+  it("keeps running and recording at the normal rate after landing, then resumes in place", async () => {
+    const session = useSession();
+    session.chooseMode("keyboard");
+    session.model.position.set(100, GROUND.height + 0.01, 0);
+    session.model.velocity.set(0, -3, 0);
+    await session.start();
+    for (let i = 0; i < 180; i++) {
+      await vi.advanceTimersByTimeAsync(1000 / 60);
+      session.frame();
+    }
+    expect(session.running).toBe(true);
+    expect(session.telemetry.phase).toBe("walking");
+    const rows = vi
+      .mocked(fetch)
+      .mock.calls.flatMap(([, init]) => JSON.parse(init!.body as string).rows);
+    expect(rows.length).toBeGreaterThan(10);
+    expect(rows.length).toBeLessThan(35);
+    key("keydown", "KeyW");
+    for (let i = 0; i < 30; i++) {
+      vi.advanceTimersByTime(1000 / 60);
+      session.frame();
+    }
+    expect(session.model.velocity.z).toBeLessThan(-1);
+    session.stop();
+    const bird = session.model;
+    const position = bird.position.clone();
+    await session.start();
+    expect(session.model).toBe(bird);
+    expect(session.model.position.equals(position)).toBe(true);
+    expect(session.model.grounded).toBe(true);
+  });
+
+  it("routes controller sticks and Triangle through walking, temporary look and a single hop", async () => {
+    const session = await connectedSession();
+    session.model.position.set(100, GROUND.height + 0.01, 0);
+    session.model.velocity.set(0, -3, 0);
+    session.camera.reset(session.model);
+    await session.start();
+    vi.advanceTimersByTime(20);
+    session.frame();
+    expect(session.model.grounded).toBe(true);
+    const send = (controls: Partial<InputSample>) =>
+      hardware.input({
+        ...restingControls,
+        left: 0,
+        right: 0,
+        options: false,
+        transport: "usb",
+        motion: null,
+        ...controls,
+      });
+    send({ rightStick: { x: 1, y: 0 } });
+    vi.advanceTimersByTime(20);
+    session.frame();
+    send({ rightStick: { x: 1, y: 0 }, leftStick: { x: 0, y: -1 } });
+    for (let i = 0; i < 30; i++) {
+      vi.advanceTimersByTime(1000 / 60);
+      session.frame();
+    }
+    expect(session.camera.yaw).toBeLessThan(-0.3);
+    expect(session.model.position.x).toBeGreaterThan(100);
+    send({ triangle: true });
+    for (let i = 0; i < 40; i++) {
+      vi.advanceTimersByTime(1000 / 60);
+      session.frame();
+    }
+    expect(session.model.grounded).toBe(true);
+    expect(session.model.jumpCharge).toBe(1);
+    send({ triangle: false });
+    vi.advanceTimersByTime(20);
+    session.frame();
+    expect(session.model.phase).toBe("hopping");
+    expect(session.camera.yaw).toBeCloseTo(session.model.heading);
+    for (let i = 0; i < 120; i++) {
+      send({ triangle: true });
+      vi.advanceTimersByTime(1000 / 60);
+      session.frame();
+    }
+    expect(session.model.grounded).toBe(true);
+    expect(session.running).toBe(true);
+    expect(hardware.update).toHaveBeenLastCalledWith(0, 0);
+  });
+
+  it("keeps triggers and wing loads on their corresponding sides", async () => {
+    const session = await connectedSession();
+    await session.start();
+    const squeeze = (left: number, right: number) => {
+      hardware.input({
+        ...restingControls,
+        left,
+        right,
+        options: false,
+        transport: "usb",
+        motion: null,
+      });
+      vi.advanceTimersByTime(20);
+      session.frame();
+    };
+    squeeze(0.8, 0);
+    expect(session.model.wings[0].manual).toBe(true);
+    expect(session.model.wings[1].manual).toBe(false);
+    squeeze(0, 0.8);
+    expect(session.model.wings[0].manual).toBe(false);
+    expect(session.model.wings[1].manual).toBe(true);
+
+    vi.spyOn(session.model, "step").mockImplementation(() => {
+      session.model.wings[0].torque = -2.2;
+      session.model.wings[1].torque = 0;
+    });
+    for (let i = 0; i < 60; i++) {
+      vi.advanceTimersByTime(1000 / 60);
+      session.frame();
+    }
+    expect(hardware.update).toHaveBeenLastCalledWith(4, 0);
+    expect(session.telemetry.leftStrength).toBe(4);
+    expect(session.telemetry.rightStrength).toBe(0);
+  });
+
   it("uses Options presses to start, pause and cancel without repeating held input", async () => {
     const session = await connectedSession();
     let timestamp = 7_000_000;
     const options = (down: boolean) =>
       hardware.input({
+        ...restingControls,
         left: 0,
         right: 0,
         options: down,
@@ -218,6 +347,7 @@ describe("flight session lifecycle", () => {
     const session = await connectedSession();
     const options = (down: boolean) =>
       hardware.input({
+        ...restingControls,
         left: 0,
         right: 0,
         options: down,
@@ -254,6 +384,7 @@ describe("flight session lifecycle", () => {
     await session.connect();
     for (let i = 0; i <= 130; i++)
       hardware.input({
+        ...restingControls,
         left: 0,
         right: 0,
         options: false,
@@ -276,6 +407,7 @@ describe("flight session lifecycle", () => {
     const tableAngle = 0.2;
     for (let i = 131; i <= 261; i++)
       hardware.input({
+        ...restingControls,
         left: 0,
         right: 0,
         options: false,
@@ -300,6 +432,7 @@ describe("flight session lifecycle", () => {
     expect(restored.calibrated).toBe(true);
     expect(restored.calibrating).toBe(false);
     hardware.input({
+      ...restingControls,
       left: 0,
       right: 0,
       options: false,
@@ -326,6 +459,7 @@ describe("flight session lifecycle", () => {
     expect(session.calibrated).toBe(false);
     const sample = (i: number) =>
       hardware.input({
+        ...restingControls,
         left: 0,
         right: 0,
         options: false,
