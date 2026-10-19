@@ -49,12 +49,18 @@ vi.mock("./controller/device", () => ({
 }));
 
 let pinia = createPinia();
-let documentStub: EventTarget & { hidden: boolean };
+let documentStub: EventTarget & {
+  hidden: boolean;
+  querySelector: (selector: string) => Element | null;
+};
 beforeEach(() => {
   vi.useFakeTimers({ toFake: ["setInterval", "clearInterval", "performance"] });
   vi.clearAllMocks();
   hardware.motionAge = 0;
-  documentStub = Object.assign(new EventTarget(), { hidden: false });
+  documentStub = Object.assign(new EventTarget(), {
+    hidden: false,
+    querySelector: vi.fn(() => null),
+  });
   vi.stubGlobal("document", documentStub);
   vi.stubGlobal("window", Object.assign(new EventTarget(), { setInterval, clearInterval }));
   vi.stubGlobal(
@@ -188,6 +194,108 @@ describe("keyboard flight", () => {
 });
 
 describe("flight session lifecycle", () => {
+  it("pauses and restores each scene's model, camera, and position when switching", async () => {
+    const session = useSession();
+    session.chooseMode("keyboard");
+    await session.start();
+    const forestModel = session.model;
+    const forestCamera = session.camera;
+    forestModel.position.set(14, 82, -23);
+    forestCamera.yaw = 1.2;
+
+    await session.chooseScene("city");
+    expect(session.running).toBe(false);
+    expect(session.sceneId).toBe("city");
+    const cityModel = session.model;
+    const cityCamera = session.camera;
+    cityModel.position.set(40, 90, 12);
+    cityCamera.yaw = -0.8;
+
+    await session.chooseScene("forest");
+    expect(session.model).toBe(forestModel);
+    expect(session.camera).toBe(forestCamera);
+    expect(session.model.position.toArray()).toEqual([14, 82, -23]);
+    expect(session.camera.yaw).toBe(1.2);
+
+    await session.chooseScene("city");
+    expect(session.model).toBe(cityModel);
+    expect(session.camera).toBe(cityCamera);
+    expect(session.model.position.toArray()).toEqual([40, 90, 12]);
+    expect(session.camera.yaw).toBe(-0.8);
+  });
+
+  it("resets only the active scene and retains the other scene's saved state", async () => {
+    const session = useSession();
+    session.model.position.set(7, 75, 9);
+    const forestModel = session.model;
+
+    await session.chooseScene("city");
+    session.model.position.set(35, 60, -12);
+    const cityModel = session.model;
+    session.reset();
+    expect(session.sceneId).toBe("city");
+    expect(session.model).not.toBe(cityModel);
+    expect(session.model.position.toArray()).not.toEqual([35, 60, -12]);
+
+    await session.chooseScene("forest");
+    expect(session.model).toBe(forestModel);
+    expect(session.model.position.toArray()).toEqual([7, 75, 9]);
+  });
+
+  it("streams collisions with the bird and restores the spawn neighborhood on reset", async () => {
+    const session = useSession();
+    await session.chooseScene("city");
+    const world = session.world;
+    const solids = world.solids;
+    const spawn = [...world.spawn.position];
+    const original = solids.map((solid) => solid.id);
+    session.model.position.set(-120030, 80, 240090);
+    session.frame();
+    expect(world.solids).toBe(solids);
+    expect(session.model.world.solids).toBe(solids);
+    expect(solids.map((solid) => solid.id)).not.toEqual(original);
+    expect(world.chunks?.size).toBe(25);
+    const roof = solids.find((solid) => solid.id.endsWith(":hotel:roof"))!;
+    const x = (roof.min[0] + roof.max[0]) / 2;
+    const z = (roof.min[2] + roof.max[2]) / 2;
+    expect(session.model.world.supportAt(x, z, roof.max[1] + 1)?.height).toBe(roof.max[1]);
+
+    await session.chooseScene("forest");
+    await session.chooseScene("city");
+    expect(session.model.position.toArray()).toEqual([-120030, 80, 240090]);
+    session.reset();
+    expect(session.model.position.toArray()).toEqual(spawn);
+    expect(session.world.solids.map((solid) => solid.id)).toEqual(original);
+    expect(session.model.world.solids).toBe(solids);
+  });
+
+  it("ignores keyboard and controller start input while a modal dialog is open", async () => {
+    const session = await connectedSession();
+    session.chooseMode("keyboard");
+    session.model.position.set(21, 80, 6);
+    vi.mocked(documentStub.querySelector).mockReturnValue({} as Element);
+
+    key("keydown", "Space");
+    key("keydown", "KeyF");
+    key("keydown", "KeyR");
+    expect(session.running).toBe(false);
+    expect(session.keyboard).toEqual(NEUTRAL_PLAYER_INPUT);
+    expect(session.model.position.toArray()).toEqual([21, 80, 6]);
+
+    session.chooseMode("controller");
+    session.queueStart();
+    hardware.input({
+      ...restingControls,
+      left: 0,
+      right: 0,
+      options: true,
+      transport: "usb",
+      motion: null,
+    });
+    expect(session.running).toBe(false);
+    expect(session.countdown).toBe(0);
+  });
+
   it("keeps running and recording at the normal rate after landing, then resumes in place", async () => {
     const session = useSession();
     session.chooseMode("keyboard");
@@ -229,6 +337,11 @@ describe("flight session lifecycle", () => {
     vi.advanceTimersByTime(20);
     session.frame();
     expect(session.model.grounded).toBe(true);
+    session.stop();
+    session.toggleFlight();
+    expect(session.countdown).toBe(0);
+    await Promise.resolve();
+    expect(session.running).toBe(true);
     const send = (controls: Partial<InputSample>) =>
       hardware.input({
         ...restingControls,

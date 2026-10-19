@@ -20,12 +20,30 @@ import type { FlightInput } from "./flight/model";
 import { BirdCamera } from "./flight/camera";
 import { POSTURE } from "./flight/posture";
 import { FlightRecorder } from "./flight/recorder";
+import { generateForest } from "./world/forest";
+import { WorldCollision } from "./world/collision";
+import { SCENES, type SceneId, type WorldData } from "./world/types";
+
+function sceneSession(world: WorldData) {
+  world.update?.(world.spawn.position[0], world.spawn.position[2]);
+  const model = markRaw(new FlightModel(8, new WorldCollision(world.solids)));
+  model.place(world.spawn);
+  const camera = markRaw(new BirdCamera());
+  camera.reset(model);
+  return { world: markRaw(world), model, camera };
+}
 
 export const useSession = defineStore("session", () => {
-  const model = shallowRef(markRaw(new FlightModel()));
+  const initial = sceneSession(generateForest());
+  const scenes = new Map<SceneId, ReturnType<typeof sceneSession>>([["forest", initial]]);
+  const world = shallowRef(initial.world);
+  const model = shallowRef(initial.model);
   const clock = markRaw(new FixedClock());
-  const camera = markRaw(new BirdCamera());
-  camera.reset(model.value);
+  const camera = shallowRef(initial.camera);
+  const sceneId = computed(() => world.value.id);
+  const sceneName = computed(() => SCENES.find((scene) => scene.id === sceneId.value)!.name);
+  const sceneLoading = ref(false);
+  const modalOpen = () => !!document.querySelector("dialog:modal");
   const timeline = new InputTimeline(NEUTRAL_PLAYER_INPUT);
   let stepAt = 0;
   let lastFrameAt = 0;
@@ -95,8 +113,9 @@ export const useSession = defineStore("session", () => {
   });
   const canStart = computed(
     () =>
-      mode.value === "keyboard" ||
-      (connected.value && telemetry.motionReady && telemetry.motionAge < 250),
+      !sceneLoading.value &&
+      (mode.value === "keyboard" ||
+        (connected.value && telemetry.motionReady && telemetry.motionAge < 250)),
   );
   const ready = computed(() => canStart.value && (mode.value === "keyboard" || calibrated.value));
 
@@ -117,8 +136,8 @@ export const useSession = defineStore("session", () => {
 
   function groundInput(command: PlayerInput) {
     const direction = model.value.grounded
-      ? camera.walkingDirection(command.walkX, command.walkY)
-      : camera.walkingDirection(0, 0);
+      ? camera.value.walkingDirection(command.walkX, command.walkY)
+      : camera.value.walkingDirection(0, 0);
     return { ...direction, jump: command.jump };
   }
 
@@ -188,7 +207,13 @@ export const useSession = defineStore("session", () => {
           timeline.push(performance.now() / 1000, input());
         const optionsPressed = sample.options && !optionsDown;
         optionsDown = sample.options;
-        if (optionsPressed && connected.value && mode.value === "controller" && !document.hidden)
+        if (
+          optionsPressed &&
+          connected.value &&
+          mode.value === "controller" &&
+          !document.hidden &&
+          !modalOpen()
+        )
           toggleFlight();
       },
       (detail) => {
@@ -256,7 +281,7 @@ export const useSession = defineStore("session", () => {
   }
 
   async function start() {
-    if (!ready.value || starting.value || running.value) return;
+    if (!ready.value || starting.value || running.value || modalOpen()) return;
     error.value = "";
     starting.value = true;
     const request = ++operation;
@@ -280,6 +305,8 @@ export const useSession = defineStore("session", () => {
       const recording = new FlightRecorder(
         {
           mode: mode.value,
+          scene: world.value.id,
+          seed: world.value.seed,
           controller: telemetry.name,
           transport: telemetry.transport,
           factoryCalibrated: telemetry.factory,
@@ -289,7 +316,7 @@ export const useSession = defineStore("session", () => {
           ground: GROUND,
           posture: POSTURE,
           polar: POLAR,
-          flightModel: "ground-flight-v1",
+          flightModel: "world-flight-v1",
           modelStartTimeS: model.value.time,
         },
         model.value.time,
@@ -306,11 +333,44 @@ export const useSession = defineStore("session", () => {
     message.value = activityMessages[model.value.phase];
   }
 
+  function activate(scene: ReturnType<typeof sceneSession>) {
+    scene.world.update?.(scene.model.position.x, scene.model.position.z);
+    world.value = scene.world;
+    model.value = scene.model;
+    camera.value = scene.camera;
+    Object.assign(telemetry, {
+      phase: scene.model.phase,
+      speed: scene.model.velocity.length(),
+      height: scene.model.position.y,
+      sink: scene.model.velocity.y,
+      time: scene.model.time,
+    });
+  }
+
+  async function chooseScene(id: SceneId) {
+    if (sceneLoading.value || id === sceneId.value) return;
+    stop();
+    sceneLoading.value = true;
+    try {
+      let scene = scenes.get(id);
+      if (!scene) {
+        const data =
+          id === "city" ? (await import("./world/city")).generateCity() : generateForest();
+        scene = sceneSession(data);
+        scenes.set(id, scene);
+      }
+      activate(scene);
+      message.value = `${sceneName.value} ready. Start when you are ready.`;
+    } finally {
+      sceneLoading.value = false;
+    }
+  }
+
   function reset() {
-    stop("Reset to a trimmed glide. Start when you are ready.");
-    model.value = markRaw(new FlightModel());
-    camera.reset(model.value);
-    telemetry.phase = model.value.phase;
+    stop("Reset to the scene's starting point. Start when you are ready.");
+    const scene = sceneSession(world.value);
+    scenes.set(sceneId.value, scene);
+    activate(scene);
   }
 
   function chooseMode(value: "controller" | "keyboard") {
@@ -333,9 +393,13 @@ export const useSession = defineStore("session", () => {
   }
 
   function queueStart() {
-    if (!canStart.value) return;
+    if (!canStart.value || modalOpen()) return;
     if (mode.value === "controller" && !calibrated.value) {
       beginTableCapture();
+      return;
+    }
+    if (model.value.grounded) {
+      void start();
       return;
     }
     schedule(() => {
@@ -357,6 +421,7 @@ export const useSession = defineStore("session", () => {
     if (
       mode.value !== "keyboard" ||
       document.hidden ||
+      modalOpen() ||
       event.ctrlKey ||
       event.metaKey ||
       event.altKey
@@ -392,6 +457,8 @@ export const useSession = defineStore("session", () => {
   );
 
   function frame() {
+    if (sceneLoading.value || modalOpen()) return;
+    world.value.update?.(model.value.position.x, model.value.position.z);
     if (!running.value) {
       if (mode.value === "keyboard" || connected.value) {
         const command = input();
@@ -408,7 +475,7 @@ export const useSession = defineStore("session", () => {
         const command = timeline.sample(stepAt);
         const phase = model.value.phase;
         model.value.step(command, dt, groundInput(command));
-        camera.step(model.value, command.lookX, command.lookY, dt);
+        camera.value.step(model.value, command.lookX, command.lookY, dt);
         if (model.value.phase !== phase) {
           telemetry.phase = model.value.phase;
           message.value = activityMessages[model.value.phase];
@@ -517,6 +584,11 @@ export const useSession = defineStore("session", () => {
 
   return {
     model,
+    world,
+    sceneId,
+    sceneName,
+    sceneLoading,
+    chooseScene,
     clock,
     camera,
     connected,

@@ -52,16 +52,18 @@ export class BirdCamera {
   }
 
   private place(bird: FlightModel) {
-    this.target.copy(bird.position).add(new Vector3(0, 0.12, 0));
+    const anchor = bird.position.clone().add(new Vector3(0, 0.12, 0));
+    this.target.copy(anchor);
     this.target.add(
       new Vector3(-Math.sin(bird.heading), 0, -Math.cos(bird.heading)).multiplyScalar(this.lead),
     );
+    this.target.copy(bird.world.cameraPosition(anchor, this.target));
     const offset = new Vector3(
       Math.sin(this.yaw) * Math.cos(this.pitch),
       Math.sin(this.pitch),
       Math.cos(this.yaw) * Math.cos(this.pitch),
     ).multiplyScalar(this.distance);
-    this.position.copy(this.target).add(offset);
+    this.position.copy(bird.world.cameraPosition(this.target, this.target.clone().add(offset)));
     this.position.y = Math.max(0.35, this.position.y);
   }
 }

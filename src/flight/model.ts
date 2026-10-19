@@ -2,6 +2,8 @@ import { Quaternion, Vector3 } from "three";
 import { clamp, DEG, stripForce } from "./aerodynamics";
 import { POSTURE, allocateJoints, postureAcceleration, attitudeAcceleration } from "./posture";
 import { BirdLegs, LEGS } from "./legs";
+import { WorldCollision } from "../world/collision";
+import type { WorldData } from "../world/types";
 
 export const BIRD = {
   mass: 0.8,
@@ -188,6 +190,8 @@ export class FlightModel {
   time = 0;
   phase: Locomotion = "flying";
   legs = new BirdLegs();
+  world: WorldCollision;
+  groundHeight = 0;
   jumpCharge = 0;
   chargingJump = false;
   private landingCompression = 0;
@@ -209,7 +213,8 @@ export class FlightModel {
     return Math.atan2(-forward.x, -forward.z);
   }
 
-  constructor(strips = 8) {
+  constructor(strips = 8, world = new WorldCollision()) {
+    this.world = world;
     this.wings = [wing(-1, strips), wing(1, strips)];
     this.tail.position.set(0, 0, BIRD.tailZ);
     this.trim();
@@ -217,6 +222,43 @@ export class FlightModel {
     this.loads();
     this.legs.step(this.position, this.orientation, this.velocity, false, 1);
     for (const foot of this.legs.feet) foot.previous.copy(foot.position);
+  }
+
+  place(spawn: WorldData["spawn"]) {
+    this.position.set(...spawn.position);
+    this.orientation.setFromAxisAngle(Y, spawn.heading);
+    this.velocity.applyAxisAngle(Y, spawn.heading);
+    if (spawn.grounded) {
+      this.velocity.set(0, 0, 0);
+      this.land(NEUTRAL_INPUT, spawn.position[1] - GROUND.height, 0);
+      this.groundWings(NEUTRAL_INPUT, 1);
+    } else
+      this.legs.step(this.position, this.orientation, this.velocity, false, 1, this.surfaceHeight);
+    this.previousPosition.copy(this.position);
+    this.previousOrientation.copy(this.orientation);
+    for (const foot of this.legs.feet) foot.previous.copy(foot.position);
+  }
+
+  get surfaceHeight() {
+    return this.world.supportAt(this.position.x, this.position.z, this.position.y)?.height ?? 0;
+  }
+
+  /** Sweep the body, keeping a crouched launch continuous until the legs extend. */
+  private moveBody(dt: number) {
+    const footOffset =
+      this.velocity.y > 0
+        ? Math.min(GROUND.height, Math.max(0.14, this.position.y - this.groundHeight))
+        : GROUND.height;
+    const result = this.world.move(
+      this.position,
+      this.position.clone().addScaledVector(this.velocity, dt),
+      this.velocity,
+      0.18,
+      footOffset,
+      0.22,
+    );
+    this.position.copy(result.position);
+    return result.landed;
   }
 
   private syncGeometry() {
@@ -577,18 +619,19 @@ export class FlightModel {
     }
   }
 
-  private land(input: FlightInput) {
+  private land(input: FlightInput, height: number, impactSpeed: number) {
+    this.groundHeight = height;
     this.groundHeading = this.heading;
     this.phase = "walking";
-    this.landingCompression = Math.min(0.1, Math.abs(this.velocity.y) * 0.018);
-    this.position.y = GROUND.height - this.landingCompression;
+    this.landingCompression = Math.min(0.1, Math.abs(impactSpeed) * 0.018);
+    this.position.y = height + GROUND.height - this.landingCompression;
     this.velocity.y = 0;
     this.velocity.clampLength(0, GROUND.walkSpeed);
     this.omega.set(0, 0, 0);
     this.chargingJump = false;
     this.jumpCharge = 0;
     this.orientation.setFromAxisAngle(Y, this.groundHeading);
-    this.legs.plant(this.position, this.orientation);
+    this.legs.plant(this.position, this.orientation, height);
     this.takeoffReady = input.left <= BIRD.triggerRelease && input.right <= BIRD.triggerRelease;
   }
 
@@ -603,7 +646,9 @@ export class FlightModel {
       const height =
         GROUND.minJumpHeight + (GROUND.maxJumpHeight - GROUND.minJumpHeight) * this.jumpCharge;
       // Stored leg work lifts the crouched body and supplies the chosen jump height.
-      this.velocity.y = Math.sqrt(2 * BIRD.gravity * (height + GROUND.height - this.position.y));
+      this.velocity.y = Math.sqrt(
+        2 * BIRD.gravity * (height + this.groundHeight + GROUND.height - this.position.y),
+      );
       this.phase = "hopping";
       this.chargingJump = false;
       this.jumpCharge = 0;
@@ -629,7 +674,7 @@ export class FlightModel {
     this.groundWings(input, dt);
     if (
       this.phase === "launching" &&
-      this.position.y >= GROUND.wingClearance &&
+      this.position.y - this.surfaceHeight >= GROUND.wingClearance &&
       this.wings.every((w) => w.fold < 3 * DEG)
     ) {
       this.phase = "flying";
@@ -647,18 +692,42 @@ export class FlightModel {
       );
       this.landingCompression *= Math.exp(-18 * dt);
       if (this.landingCompression < 0.0001) this.landingCompression = 0;
-      this.position.y =
-        GROUND.height -
-        Math.max(GROUND.crouchDepth * this.jumpCharge, this.landingCompression) +
-        this.legs.bob;
-    } else this.velocity.y -= BIRD.gravity * dt;
+      const result = this.world.move(
+        this.position,
+        this.position.clone().addScaledVector(this.velocity, dt),
+        this.velocity,
+        0.18,
+        this.position.y - this.groundHeight,
+        0.22,
+      );
+      this.position.copy(result.position);
+      const support = this.world.supportAt(
+        this.position.x,
+        this.position.z,
+        this.groundHeight + 0.001,
+      );
+      if (support && Math.abs(support.height - this.groundHeight) < 0.001) {
+        this.position.y =
+          this.groundHeight +
+          GROUND.height -
+          Math.max(GROUND.crouchDepth * this.jumpCharge, this.landingCompression) +
+          this.legs.bob;
+      } else {
+        // Leaving a ledge unfolds the wings into a glide, without adding a jump or stroke.
+        this.phase = "launching";
+        this.chargingJump = false;
+        this.jumpCharge = 0;
+      }
+    } else {
+      this.velocity.y -= BIRD.gravity * dt;
+      const impactSpeed = this.velocity.y;
+      const landed = this.moveBody(dt);
+      if (landed && impactSpeed <= 0) this.land(input, landed.height, impactSpeed);
+    }
     this.orientation.slerp(
       new Quaternion().setFromAxisAngle(Y, this.groundHeading),
       1 - Math.exp(-12 * dt),
     );
-    this.position.addScaledVector(this.velocity, dt);
-    if (!this.grounded && this.position.y <= GROUND.height && this.velocity.y <= 0)
-      this.land(input);
     return false;
   }
 
@@ -670,7 +739,14 @@ export class FlightModel {
     this.jumpHeld = ground.jump;
     if (this.phase !== "flying") {
       if (!this.groundStep(input, ground, jump, dt)) {
-        this.legs.step(this.position, this.orientation, this.velocity, this.grounded, dt);
+        this.legs.step(
+          this.position,
+          this.orientation,
+          this.velocity,
+          this.grounded,
+          dt,
+          this.grounded ? this.groundHeight : this.surfaceHeight,
+        );
         if (this.grounded)
           this.position.y = this.legs.supportHeight(this.position, this.orientation);
         return;
@@ -683,7 +759,8 @@ export class FlightModel {
     this.jointWork += this.jointPower * dt;
     this.aerodynamicWork += this.aerodynamicPower * dt;
     this.velocity.addScaledVector(this.force, dt / BIRD.mass);
-    this.position.addScaledVector(this.velocity, dt);
+    const impactSpeed = this.velocity.y;
+    const landed = this.moveBody(dt);
     const angularMomentum = this.omega.clone().multiply(BIRD.inertia);
     const acceleration = this.moment
       .clone()
@@ -697,11 +774,18 @@ export class FlightModel {
           new Quaternion().setFromAxisAngle(this.omega.clone().divideScalar(rate), rate * dt),
         )
         .normalize();
-    if (this.position.y <= GROUND.height && this.velocity.y <= 0) {
-      this.land(input);
+    if (landed && impactSpeed <= 0) {
+      this.land(input, landed.height, impactSpeed);
       this.groundWings(input, dt);
     }
-    this.legs.step(this.position, this.orientation, this.velocity, this.grounded, dt);
+    this.legs.step(
+      this.position,
+      this.orientation,
+      this.velocity,
+      this.grounded,
+      dt,
+      this.grounded ? this.groundHeight : this.surfaceHeight,
+    );
   }
 
   get energy() {

@@ -1,20 +1,15 @@
 <script setup lang="ts">
-import { onUnmounted } from "vue";
+import { onUnmounted, watch } from "vue";
 import { useLoop } from "@tresjs/core";
 import {
   ArrowHelper,
   BoxGeometry,
-  BufferGeometry,
-  Color,
   ConeGeometry,
   CylinderGeometry,
-  Float32BufferAttribute,
   Group,
-  InstancedMesh,
   Matrix4,
   Mesh,
   MeshStandardMaterial,
-  Object3D,
   PerspectiveCamera,
   Quaternion,
   SphereGeometry,
@@ -22,6 +17,7 @@ import {
 } from "three";
 import { useSession } from "../session";
 import { legPose } from "../flight/legs";
+import { createWorldRenderer, disposeGroup } from "../world/render";
 
 const session = useSession();
 const bird = new Group();
@@ -98,67 +94,20 @@ const arrows = session.model.wings.flatMap((w) =>
   }),
 );
 
-const forest = new Group();
-const treeCount = 700;
-const trees = new InstancedMesh(
-  new ConeGeometry(1, 1, 5),
-  new MeshStandardMaterial({ color: "#5b7970", flatShading: true }),
-  treeCount,
+const environment = new Group();
+let worldRenderer: ReturnType<typeof createWorldRenderer>;
+watch(
+  () => session.world,
+  (world) => {
+    worldRenderer?.dispose();
+    environment.clear();
+    worldRenderer = createWorldRenderer(world);
+    environment.add(worldRenderer.group);
+  },
+  { immediate: true },
 );
-const trunks = new InstancedMesh(
-  new CylinderGeometry(0.15, 0.2, 1, 4),
-  new MeshStandardMaterial({ color: "#776c55" }),
-  treeCount,
-);
-const transform = new Object3D();
-for (let i = 0; i < treeCount; i++) {
-  const z = -1400 + (i % 35) * 65 + Math.sin(i * 7) * 22;
-  let x = (Math.floor(i / 35) - 10) * 65 + Math.cos(i * 3) * 20;
-  if (Math.abs(x - Math.sin(z / 250) * 80) < 55) x += 100;
-  const height = 4 + (Math.sin(i * 12) + 1) * 5;
-  transform.position.set(x, height * 0.55, z);
-  transform.scale.set(height * 0.37, height, height * 0.37);
-  transform.rotation.y = i * 1.3;
-  transform.updateMatrix();
-  trees.setMatrixAt(i, transform.matrix);
-  trees.setColorAt(
-    i,
-    new Color().setHSL(0.39 + Math.sin(i) * 0.025, 0.12, 0.36 + Math.cos(i * 3) * 0.08),
-  );
-  transform.position.y = height * 0.15;
-  transform.scale.set(1, height * 0.3, 1);
-  transform.updateMatrix();
-  trunks.setMatrixAt(i, transform.matrix);
-}
-forest.add(trees, trunks);
-const water = new MeshStandardMaterial({
-  color: "#82aaa9",
-  roughness: 0.4,
-  metalness: 0.12,
-  polygonOffset: true,
-  polygonOffsetFactor: -1,
-  polygonOffsetUnits: -1,
-});
-// Shared edges avoid overlapping water tiles. Separation and depth bias keep
-// the ribbon above the ground even at shallow viewing angles in the distance.
-const riverGeometry = new BufferGeometry();
-const riverVertices: number[] = [];
-const riverIndices: number[] = [];
-for (let i = 0; i <= 240; i++) {
-  const z = -3000 + i * 25;
-  const x = Math.sin(z / 250) * 80;
-  riverVertices.push(x - 27.5, 0.2, z, x + 27.5, 0.2, z);
-  if (i < 240) {
-    const a = i * 2;
-    riverIndices.push(a, a + 2, a + 1, a + 1, a + 2, a + 3);
-  }
-}
-riverGeometry.setAttribute("position", new Float32BufferAttribute(riverVertices, 3));
-riverGeometry.setIndex(riverIndices);
-riverGeometry.computeVertexNormals();
-forest.add(new Mesh(riverGeometry, water));
 
-const camera = new PerspectiveCamera(48, 1, 0.5, 3500);
+const camera = new PerspectiveCamera(48, 1, 0.05, 3500);
 const renderedPosition = new Vector3();
 const renderedRotation = new Quaternion();
 const cameraTarget = new Vector3();
@@ -169,7 +118,8 @@ onBeforeRender(() => {
   const alpha = session.running ? session.clock.alpha : 1;
   renderedPosition.copy(f.previousPosition).lerp(f.position, alpha);
   renderedRotation.copy(f.previousOrientation).slerp(f.orientation, alpha);
-  bird.position.copy(renderedPosition);
+  worldRenderer.update(renderedPosition.x, renderedPosition.z);
+  bird.position.copy(renderedPosition).sub(worldRenderer.origin);
   bird.quaternion.copy(renderedRotation);
   const inverseRotation = renderedRotation.clone().invert();
   legs.forEach((leg, i) => {
@@ -185,7 +135,7 @@ onBeforeRender(() => {
     leg.hip.position.copy(pose.hip);
     leg.joint.position.copy(pose.joint);
     leg.foot.position.copy(pose.ankle);
-    leg.foot.rotation.x = f.flying && f.position.y > 1.1 ? -0.6 : 0;
+    leg.foot.rotation.x = f.flying && f.position.y - f.surfaceHeight > 1.1 ? -0.6 : 0;
   });
   f.surfaces.forEach((s, i) => {
     const span = new Vector3().crossVectors(s.chord, s.normal).normalize();
@@ -204,44 +154,32 @@ onBeforeRender(() => {
     }
   });
   camera.position.copy(session.camera.previousPosition).lerp(session.camera.position, alpha);
-  cameraTarget.copy(session.camera.previousTarget).lerp(session.camera.target, alpha);
+  camera.position.sub(worldRenderer.origin);
+  cameraTarget
+    .copy(session.camera.previousTarget)
+    .lerp(session.camera.target, alpha)
+    .sub(worldRenderer.origin);
   camera.lookAt(cameraTarget);
 });
 
 onUnmounted(() => {
-  const geometries = new Set();
-  const materials = new Set();
-  for (const group of [bird, forest])
-    group.traverse((object) => {
-      if (object instanceof Mesh) {
-        if (!geometries.has(object.geometry)) {
-          object.geometry.dispose();
-          geometries.add(object.geometry);
-        }
-        for (const material of Array.isArray(object.material)
-          ? object.material
-          : [object.material]) {
-          if (!materials.has(material)) {
-            material.dispose();
-            materials.add(material);
-          }
-        }
-      }
-    });
+  disposeGroup(bird);
+  worldRenderer.dispose();
   arrows.forEach((arrow) => arrow.dispose());
 });
 </script>
 
 <template>
   <primitive :object="camera" />
-  <TresFog :args="['#c7d9cf', 180, 1300]" />
+  <TresFog
+    :args="[
+      session.world.skyColor,
+      session.world.id === 'city' ? 120 : 180,
+      session.world.id === 'city' ? 450 : 1300,
+    ]"
+  />
   <TresHemisphereLight :args="['#f7f0dc', '#5d7568', 2.5]" />
   <TresDirectionalLight :position="[150, 200, 70]" :intensity="3" color="#ffe2b2" />
-  <TresMesh :rotation="[-Math.PI / 2, 0, 0]">
-    <!-- Smaller triangles prevent the ground from obscuring feet at close viewing distances. -->
-    <TresPlaneGeometry :args="[20000, 20000, 100, 100]" />
-    <TresMeshStandardMaterial color="#99aa89" :roughness="1" />
-  </TresMesh>
-  <primitive :object="forest" />
+  <primitive :object="environment" />
   <primitive :object="bird" />
 </template>

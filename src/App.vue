@@ -2,6 +2,7 @@
 import { onErrorCaptured, ref } from "vue";
 import { TresCanvas } from "@tresjs/core";
 import FlightScene from "./components/FlightScene.vue";
+import ScenePicker from "./components/ScenePicker.vue";
 import { useSession } from "./session";
 import { KEYBOARD_BINDINGS } from "./controller/keyboard";
 import { DEG } from "./flight/aerodynamics";
@@ -24,7 +25,12 @@ onErrorCaptured((error) => {
   >
     <div class="grid flex-1 lg:min-h-0 lg:grid-cols-[minmax(0,1fr)_350px]">
       <section class="relative h-[62dvh] min-h-96 min-w-0 overflow-hidden bg-[#c7d9cf] lg:h-full">
-        <TresCanvas v-if="!sceneError" clear-color="#c7d9cf" :dpr="[1, 1.75]" :antialias="true">
+        <TresCanvas
+          v-if="!sceneError"
+          :clear-color="session.world.skyColor"
+          :dpr="[1, 1.75]"
+          :antialias="true"
+        >
           <FlightScene />
         </TresCanvas>
         <div v-else class="absolute inset-0 flex items-center justify-center p-8 text-[#203c3b]">
@@ -34,7 +40,7 @@ onErrorCaptured((error) => {
           class="pointer-events-none absolute inset-x-0 top-0 flex items-start justify-between p-6 text-[#294742]"
         >
           <div>
-            <p class="text-[10px] font-semibold tracking-[0.22em]">OPEN AIR / FLIGHT 01</p>
+            <p class="text-[10px] font-semibold tracking-[0.22em]">{{ session.sceneName }}</p>
             <p class="mt-2 font-serif text-2xl">Find your wings.</p>
           </div>
           <span
@@ -195,10 +201,11 @@ onErrorCaptured((error) => {
                       ? "Pause"
                       : session.starting
                         ? "Starting…"
-                        : session.telemetry.phase === "walking" ||
-                            session.telemetry.phase === "hopping"
+                        : session.telemetry.time > 0
                           ? "Resume"
-                          : "Start flight"
+                          : session.telemetry.phase === "walking"
+                            ? "Start"
+                            : "Start flight"
               }}
             </button>
             <button :class="button" @click="session.reset">Reset</button>
@@ -213,6 +220,8 @@ onErrorCaptured((error) => {
             {{ session.error }}
           </p>
         </section>
+
+        <ScenePicker :button-class="button" />
 
         <section class="space-y-5 border-t border-white/10 pt-5">
           <div class="space-y-3">

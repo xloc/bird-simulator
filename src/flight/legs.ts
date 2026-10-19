@@ -43,16 +43,18 @@ export class BirdLegs {
   }));
   private airTime = 1;
   private extension = 1;
+  private groundHeight = 0;
 
   private standingFoot(side: number, position: Vector3, orientation: Quaternion) {
     const foot = new Vector3(side * LEGS.hipX, 0, LEGS.footZ)
       .applyQuaternion(orientation)
       .add(position);
-    foot.y = LEGS.footHeight;
+    foot.y = this.groundHeight + LEGS.footHeight;
     return foot;
   }
 
-  plant(position: Vector3, orientation: Quaternion) {
+  plant(position: Vector3, orientation: Quaternion, groundHeight = 0) {
+    this.groundHeight = groundHeight;
     for (const foot of this.feet) {
       foot.position.copy(this.standingFoot(foot.side, position, orientation));
       foot.previous.copy(foot.position);
@@ -88,11 +90,13 @@ export class BirdLegs {
     velocity: Vector3,
     grounded: boolean,
     dt: number,
+    groundHeight = 0,
   ) {
+    this.groundHeight = groundHeight;
     for (const foot of this.feet) foot.previous.copy(foot.position);
     if (!grounded) {
       this.airTime += dt;
-      const deployed = this.airTime < 0.06 || (velocity.y < 0 && position.y < 1.1);
+      const deployed = this.airTime < 0.06 || (velocity.y < 0 && position.y - groundHeight < 1.1);
       this.extension += ((deployed ? 1 : 0) - this.extension) * (1 - Math.exp(-30 * dt));
       for (const foot of this.feet) {
         const target = new Vector3(
@@ -102,14 +106,14 @@ export class BirdLegs {
         )
           .applyQuaternion(orientation)
           .add(position);
-        target.y = Math.max(LEGS.footHeight, target.y);
+        target.y = Math.max(groundHeight + LEGS.footHeight, target.y);
         foot.position.copy(target);
         foot.progress = 1;
         foot.planted = false;
       }
       return;
     }
-    if (this.airTime > 0) this.plant(position, orientation);
+    if (this.airTime > 0) this.plant(position, orientation, groundHeight);
     this.airTime = 0;
     const swing = this.feet.find((foot) => !foot.planted);
     if (swing) {
@@ -125,7 +129,7 @@ export class BirdLegs {
       .map((foot) => {
         const target = this.standingFoot(foot.side, position, orientation);
         target.addScaledVector(velocity, LEGS.stepTime * 1.5);
-        target.y = LEGS.footHeight;
+        target.y = groundHeight + LEGS.footHeight;
         return { foot, target, distance: foot.position.distanceTo(target) };
       })
       .sort((a, b) => b.distance - a.distance);
