@@ -1,0 +1,88 @@
+import { expect, it } from "vite-plus/test";
+import { Euler } from "three";
+import { BIRD, FlightModel, NEUTRAL_INPUT } from "./model";
+import { DEG } from "./aerodynamics";
+
+it("approaches a held pitch/bank target and returns toward level without flapping", () => {
+  const f = new FlightModel();
+  const target = { ...NEUTRAL_INPUT, pitch: 10 * DEG, roll: 20 * DEG };
+  f.step(target, 1 / 120);
+  expect(f.orientation.angleTo(f.previousOrientation)).toBeLessThan(DEG);
+  for (let i = 1; i < 120 * 8; i++) f.step(target, 1 / 120);
+  const held = new Euler().setFromQuaternion(f.orientation, "YXZ");
+  expect(Math.abs(held.x / DEG - 10)).toBeLessThan(5);
+  expect(Math.abs(-held.z / DEG - 20)).toBeLessThan(5);
+  for (let i = 0; i < 120 * 8; i++) f.step(NEUTRAL_INPUT, 1 / 120);
+  const level = new Euler().setFromQuaternion(f.orientation, "YXZ");
+  expect(Math.abs(level.x / DEG)).toBeLessThan(5);
+  expect(Math.abs(level.z / DEG)).toBeLessThan(5);
+  for (const wing of f.wings) {
+    expect(wing.manual || wing.returning).toBe(false);
+    expect(Math.abs(wing.angle)).toBeLessThanOrEqual(BIRD.assistAngle);
+    expect(Math.abs(wing.rate)).toBeLessThan(DEG);
+  }
+});
+
+it("keeps bank near level after a small disturbance at the maximum pitch request", () => {
+  const f = new FlightModel();
+  f.orientation.setFromEuler(new Euler(0, 0, -DEG, "YXZ"));
+  f.synchronize(NEUTRAL_INPUT);
+  for (let i = 0; i < 120 * 12; i++) {
+    f.step({ ...NEUTRAL_INPUT, pitch: 30 * DEG }, 1 / 120);
+    const pose = new Euler().setFromQuaternion(f.orientation, "YXZ");
+    expect(Math.abs(pose.z / DEG)).toBeLessThan(5);
+  }
+  const pose = new Euler().setFromQuaternion(f.orientation, "YXZ");
+  expect(Math.abs(pose.x / DEG - 30)).toBeLessThan(3);
+  expect(f.grounded).toBe(false);
+});
+
+it("recovers from abrupt independent strokes without losing the held attitude", () => {
+  const f = new FlightModel();
+  const target = { ...NEUTRAL_INPUT, pitch: 8 * DEG };
+  for (let i = 0; i < 360; i++) f.step(target, 1 / 120);
+  // Full pulls, partial reversals and releases, like a controller sampled at 60 Hz.
+  const strokes = [
+    [1, 1],
+    [1, 1],
+    [0, 0],
+    [0, 0],
+    [1, 0],
+    [0.68, 0],
+    [0, 0],
+    [0, 0],
+    [0, 1],
+    [0, 1],
+    [0, 0],
+    [0, 0],
+    [1, 1],
+    [1, 1],
+    [0, 0],
+    [0, 0],
+  ];
+  for (let i = 0; i < 120 * 6; i++) {
+    const [left, right] = strokes[Math.floor(i / 12)] ?? [0, 0];
+    f.step({ ...target, left: left!, right: right! }, 1 / 120);
+    const pose = new Euler().setFromQuaternion(f.orientation, "YXZ");
+    expect(Math.abs(pose.z / DEG)).toBeLessThan(20);
+    expect(Math.abs(pose.x / DEG - 8)).toBeLessThan(20);
+  }
+  const pose = new Euler().setFromQuaternion(f.orientation, "YXZ");
+  expect(Math.abs(pose.x / DEG - 8)).toBeLessThan(3);
+  expect(Math.abs(pose.z / DEG)).toBeLessThan(3);
+  expect(f.grounded).toBe(false);
+});
+
+it("keeps pitch and bank bounded through slow strokes at maximum nose-up attitude", () => {
+  const f = new FlightModel();
+  const target = { ...NEUTRAL_INPUT, pitch: 30 * DEG };
+  for (let i = 0; i < 600; i++) f.step(target, 1 / 120);
+  for (let i = 0; i < 2400; i++) {
+    const pull = (1 - Math.cos((Math.floor(i / 2) / 60) * 3 * Math.PI)) / 2;
+    f.step({ ...target, left: pull, right: pull }, 1 / 120);
+    const pose = new Euler().setFromQuaternion(f.orientation, "YXZ");
+    expect(Math.abs(pose.z / DEG)).toBeLessThan(5);
+    expect(Math.abs(pose.x / DEG - 30)).toBeLessThan(8);
+  }
+  expect(f.grounded).toBe(false);
+});
