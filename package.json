@@ -11,8 +11,8 @@
     "test": "vp test",
     "fmt": "vp fmt . --write",
     "preview": "vp preview",
-    "preview:pages": "pnpm build && wrangler pages dev",
-    "deploy": "pnpm build && wrangler pages deploy",
+    "preview:workers": "pnpm build && wrangler dev",
+    "deploy": "pnpm build && wrangler deploy",
     "verify": "vp check && vp run check:vue && vp test && vp build"
   },
   "dependencies": {
