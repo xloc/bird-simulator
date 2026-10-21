@@ -316,7 +316,7 @@ export const useSession = defineStore("session", () => {
           ground: GROUND,
           posture: POSTURE,
           polar: POLAR,
-          flightModel: "world-flight-v1",
+          flightModel: "world-flight-v2",
           modelStartTimeS: model.value.time,
         },
         model.value.time,

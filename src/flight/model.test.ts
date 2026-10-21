@@ -213,7 +213,8 @@ describe("manual wings and flight", () => {
   });
 
   it.each([
-    { pitch: 15, cadence: 1.5, shape: "smooth", minimumPower: 0.5 },
+    { pitch: 15, cadence: 1.5, shape: "smooth", minimumPower: 3.5 },
+    { pitch: 15, cadence: 1.5, shape: "quick", minimumPower: 2.5 },
     { pitch: 15, cadence: 2, shape: "smooth", minimumPower: 3 },
     { pitch: 15, cadence: 3, shape: "smooth", minimumPower: 8 },
     { pitch: 15, cadence: 2, shape: "quick", minimumPower: 2.5 },
@@ -256,6 +257,28 @@ describe("manual wings and flight", () => {
       expect(f.grounded).toBe(false);
     },
   );
+
+  it("retains useful dive energy through an unpowered pull-up", () => {
+    const f = new FlightModel();
+    const height = f.position.y;
+    const energy = f.energy;
+    let peak = -Infinity;
+    let peakLoss = 0;
+    for (let i = 0; i < 120 * 10; i++) {
+      const t = i / 120;
+      const pitch = (t < 4 ? -30 : -30 + 60 * Math.min(1, (t - 4) / 0.25)) * DEG;
+      f.step({ ...NEUTRAL_INPUT, pitch }, 1 / 120);
+      if (t > 5 && f.position.y > peak) {
+        peak = f.position.y;
+        peakLoss = -f.aerodynamicWork;
+      }
+    }
+    expect(peak).toBeGreaterThan(height - 12);
+    expect(peakLoss).toBeLessThan(110);
+    // Posture assistance cannot pay for the recovered height with extra flaps.
+    expect(Math.abs(f.jointWork)).toBeLessThan(0.5);
+    expect(Math.abs(f.energy - energy - f.jointWork - f.aerodynamicWork)).toBeLessThan(4);
+  });
 
   it("stays finite through full asymmetric strokes, stalls and ground contact", () => {
     const f = new FlightModel();

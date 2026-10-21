@@ -12,7 +12,7 @@ export const POSTURE = {
   rollAcceleration: 4,
   yawDamping: 4,
   slipGain: 2,
-  yawWeight: 0.5, // Pitch/bank tracking takes priority over turn coordination.
+  yawWeight: 1, // Coordinate heading without letting sideslip accumulate between strokes.
   forceWeight: 0.6, // Preserve stroke lift/thrust while correcting attitude.
   featherPreparationWeight: 30,
   strokeRateCost: 0.2,
@@ -111,67 +111,77 @@ export function allocateJoints(
   desired: number[],
   evaluate: (joints: number[]) => number[],
 ) {
-  const base = evaluate(current);
-  const columns = current.map((value, i) => {
-    const plus = Math.min(0.1 * DEG, upper[i]! - value);
-    const minus = Math.min(0.1 * DEG, value - lower[i]!);
-    if (plus + minus < 1e-8) return base.map(() => 0);
-    const high = [...current],
-      low = [...current];
-    high[i] = value + plus;
-    low[i] = value - minus;
-    const a = evaluate(high),
-      b = evaluate(low);
-    return a.map((value, j) => (value - b[j]!) / (plus + minus));
-  });
-  const result = [...current];
-  const error = base.map((value, j) => value - desired[j]!);
-  const dot = (a: number[], b: number[]) => a.reduce((sum, value, j) => sum + value * b[j]!, 0);
-  for (let pass = 0; pass < 12; pass++) {
-    for (let i = 0; i < result.length; i++) {
-      if (lower[i] === upper[i]) continue;
-      // Solve the two shoulders together: serial updates can invent left/right
-      // asymmetry during a symmetric stroke when both shoulder columns are strong.
-      if (i === 3 && lower[4] !== upper[4]) {
-        const a = columns[3]!,
-          b = columns[4]!;
-        const aa = dot(a, a) + penalty[3]!,
-          ab = dot(a, b),
-          bb = dot(b, b) + penalty[4]!;
-        const ga = dot(a, error) + penalty[3]! * (result[3]! - preferred[3]!);
-        const gb = dot(b, error) + penalty[4]! * (result[4]! - preferred[4]!);
-        const determinant = aa * bb - ab * ab;
-        const changes = [(-bb * ga + ab * gb) / determinant, (ab * ga - aa * gb) / determinant];
-        for (let k = 0; k < 2; k++) {
-          const index = 3 + k;
-          const next = clamp(result[index]! + changes[k]!, lower[index]!, upper[index]!);
-          for (let j = 0; j < error.length; j++)
-            error[j]! += columns[index]![j]! * (next - result[index]!);
-          result[index] = next;
+  // Feather pitch and tail cant interact strongly during stroke reversal.
+  // Recompute the response after an accepted move, within the same joint limits.
+  for (let iteration = 0; iteration < 3; iteration++) {
+    const base = evaluate(current);
+    const columns = current.map((value, i) => {
+      const plus = Math.min(0.1 * DEG, upper[i]! - value);
+      const minus = Math.min(0.1 * DEG, value - lower[i]!);
+      if (plus + minus < 1e-8) return base.map(() => 0);
+      const high = [...current],
+        low = [...current];
+      high[i] = value + plus;
+      low[i] = value - minus;
+      const a = evaluate(high),
+        b = evaluate(low);
+      return a.map((value, j) => (value - b[j]!) / (plus + minus));
+    });
+    const result = [...current];
+    const error = base.map((value, j) => value - desired[j]!);
+    const dot = (a: number[], b: number[]) => a.reduce((sum, value, j) => sum + value * b[j]!, 0);
+    for (let pass = 0; pass < 12; pass++) {
+      for (let i = 0; i < result.length; i++) {
+        if (lower[i] === upper[i]) continue;
+        // Solve the two shoulders together: serial updates can invent left/right
+        // asymmetry during a symmetric stroke when both shoulder columns are strong.
+        if (i === 3 && lower[4] !== upper[4]) {
+          const a = columns[3]!,
+            b = columns[4]!;
+          const aa = dot(a, a) + penalty[3]!,
+            ab = dot(a, b),
+            bb = dot(b, b) + penalty[4]!;
+          const ga = dot(a, error) + penalty[3]! * (result[3]! - preferred[3]!);
+          const gb = dot(b, error) + penalty[4]! * (result[4]! - preferred[4]!);
+          const determinant = aa * bb - ab * ab;
+          const changes = [(-bb * ga + ab * gb) / determinant, (ab * ga - aa * gb) / determinant];
+          for (let k = 0; k < 2; k++) {
+            const index = 3 + k;
+            const next = clamp(result[index]! + changes[k]!, lower[index]!, upper[index]!);
+            for (let j = 0; j < error.length; j++)
+              error[j]! += columns[index]![j]! * (next - result[index]!);
+            result[index] = next;
+          }
+          i++;
+          continue;
         }
-        i++;
-        continue;
+        const column = columns[i]!;
+        const next = clamp(
+          result[i]! -
+            (dot(column, error) + penalty[i]! * (result[i]! - preferred[i]!)) /
+              (dot(column, column) + penalty[i]!),
+          lower[i]!,
+          upper[i]!,
+        );
+        for (let j = 0; j < error.length; j++) error[j]! += column[j]! * (next - result[i]!);
+        result[i] = next;
       }
-      const column = columns[i]!;
-      const next = clamp(
-        result[i]! -
-          (dot(column, error) + penalty[i]! * (result[i]! - preferred[i]!)) /
-            (dot(column, column) + penalty[i]!),
-        lower[i]!,
-        upper[i]!,
-      );
-      for (let j = 0; j < error.length; j++) error[j]! += column[j]! * (next - result[i]!);
-      result[i] = next;
     }
-  }
-  // A local slope can be misleading near stall. Only accept a step that improves the real load.
-  const cost = (values: number[]) =>
-    evaluate(values).reduce((sum, value, j) => sum + (value - desired[j]!) ** 2, 0) +
-    values.reduce((sum, value, i) => sum + penalty[i]! * (value - preferred[i]!) ** 2, 0);
-  const before = cost(current);
-  for (const fraction of [1, 0.5, 0.25]) {
-    const candidate = current.map((value, i) => value + fraction * (result[i]! - value));
-    if (cost(candidate) < before) return candidate;
+    // A local slope can be misleading near stall. Only accept a step that improves the real load.
+    const cost = (values: number[]) =>
+      evaluate(values).reduce((sum, value, j) => sum + (value - desired[j]!) ** 2, 0) +
+      values.reduce((sum, value, i) => sum + penalty[i]! * (value - preferred[i]!) ** 2, 0);
+    const before = cost(current);
+    let improved = false;
+    for (const fraction of [1, 0.5, 0.25]) {
+      const candidate = current.map((value, i) => value + fraction * (result[i]! - value));
+      if (cost(candidate) < before) {
+        current = candidate;
+        improved = true;
+        break;
+      }
+    }
+    if (!improved) break;
   }
   return current;
 }

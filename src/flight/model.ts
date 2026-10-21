@@ -16,6 +16,7 @@ export const BIRD = {
   wingIncidence: 4 * DEG,
   wingDihedral: 5 * DEG,
   bodyDragZ: 0.3,
+  bodyDragArea: new Vector3(0.035, 0.025, 0.002), // Cd × area, m²; retain lateral stability.
   tailZ: 0.8, // Balance stroke pitching moments with less tail force.
   tailArea: 0.1,
   powerAlpha: 14 * DEG,
@@ -23,13 +24,14 @@ export const BIRD = {
   tailAlpha: 16 * DEG,
   strokeDown: 75 * DEG,
   jointSpeed: 16,
+  featherActiveRate: 0.8, // rad/s; full feathering well below a comfortable stroke's peak speed.
   assistAngle: 15 * DEG,
   assistSpeed: 8 * DEG,
   featherCommonLimit: 22 * DEG, // Can unload the 14° power stroke and still correct pitch.
   featherDifferenceLimit: 14 * DEG,
   featherTrackingSpeed: 4320 * DEG,
   featherSpeed: 720 * DEG,
-  tailLimit: 35 * DEG,
+  tailLimit: 70 * DEG, // Follow steep local flow; tailAlpha still limits aerodynamic loading.
   tailSpeed: 720 * DEG,
   tailCantLimit: 30 * DEG, // Retain pitch authority when recovery reverses the tail load.
   tailCantSpeed: 720 * DEG,
@@ -407,8 +409,13 @@ export class FlightModel {
         const before = previous[i]!;
         w.angle = joints[i + 3]!;
         w.rate = (w.angle - before.angle) / dt;
-        // Intent drives preparation even when the shoulder waits for its feathers.
-        const drive = w.manual || w.returning ? (w.target - before.angle) / (10 * DEG) : 0;
+        // Prepare for the requested direction even if the shoulder is waiting.
+        // Only blend back to holding feathering as movement actually settles;
+        // slow trigger travel must still unload the recovering wing.
+        const drive =
+          w.manual || w.returning
+            ? (shoulders[i]! - before.angle) / (dt * BIRD.featherActiveRate)
+            : 0;
         const up = clamp(-drive, 0, 1),
           down = clamp(drive, 0, 1);
         const progress = clamp((w.angle - w.baseline) / (BIRD.strokeDown - w.baseline), 0, 1);
@@ -563,9 +570,9 @@ export class FlightModel {
       .clone()
       .multiply(
         new Vector3(
-          bodyFlow.length() * 0.035,
-          Math.abs(bodyFlow.y) * 0.025,
-          Math.abs(bodyFlow.z) * 0.007,
+          bodyFlow.length() * BIRD.bodyDragArea.x,
+          Math.abs(bodyFlow.y) * BIRD.bodyDragArea.y,
+          Math.abs(bodyFlow.z) * BIRD.bodyDragArea.z,
         ),
       )
       .multiplyScalar(-0.5 * 1.225);

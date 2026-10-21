@@ -87,6 +87,36 @@ it("keeps pitch and bank bounded through slow strokes at maximum nose-up attitud
   expect(f.grounded).toBe(false);
 });
 
+it.each([
+  { pitch: 15, delay: 0.06 },
+  { pitch: 30, delay: 0.03 },
+  { pitch: 30, delay: 0.06 },
+])("coordinates staggered strokes at $pitch° pitch with a $delay s delay", ({ pitch, delay }) => {
+  const f = new FlightModel();
+  // The flight log had slightly different post-launch shoulder baselines.
+  for (const [i, wing] of f.wings.entries()) wing.angle = wing.baseline = (-15 + i * 3.2) * DEG;
+  f.synchronize(NEUTRAL_INPUT);
+  for (let i = 0; i < 120 * 18; i++) {
+    const t = i / 120;
+    f.step(
+      {
+        left: Number(t % 0.6 < 0.21),
+        right: Number((t + 0.6 - delay) % 0.6 < 0.21),
+        pitch: pitch * DEG,
+        roll: 0,
+      },
+      1 / 120,
+    );
+    if (i < 120 * 4) continue;
+    const pose = new Euler().setFromQuaternion(f.orientation, "YXZ");
+    const air = f.velocity.clone().applyQuaternion(f.orientation.clone().invert());
+    expect(Math.abs(Math.atan2(air.x, -air.z) / DEG)).toBeLessThan(10);
+    expect(Math.abs(pose.z / DEG)).toBeLessThan(3);
+    expect(Math.abs(pose.x / DEG - pitch)).toBeLessThan(6);
+  }
+  expect(f.grounded).toBe(false);
+});
+
 it.each([1, -1])(
   "clears a persistent level-body turn after release (direction=%s)",
   (direction) => {

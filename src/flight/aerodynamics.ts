@@ -5,7 +5,7 @@ export const clamp = (value: number, min: number, max: number) =>
   Math.max(min, Math.min(max, value));
 
 export const POLAR = {
-  profileDrag: 0.012,
+  profileDrag: 0.006,
   liftProfileDrag: 0.005,
   spanEfficiency: 0.8,
 };
